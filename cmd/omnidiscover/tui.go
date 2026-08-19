@@ -58,6 +58,8 @@ type dashboardRow struct {
 	link      *omnidiscover.DiscoveredLink
 	name      string
 	address   string
+	mac       string
+	vendor    string
 	platform  string
 	neighbor  string
 	protocols string
@@ -276,7 +278,7 @@ func (d *dashboard) rebuildRows() {
 			}
 		}
 		d.rows = append(d.rows, dashboardRow{
-			device: device, link: link, name: name, address: addressSummary(device), platform: platform,
+			device: device, link: link, name: name, address: addressSummary(device), mac: macString(bestDeviceMAC(device)), vendor: vendorSummary(device), platform: platform,
 			neighbor: neighbor, protocols: protocolLabel, lastSeen: link.LastSeen,
 		})
 	}
@@ -318,14 +320,14 @@ func (d *dashboard) updateDiscoveryTable(now time.Time) {
 		d.offset = maxOffset
 	}
 	end := min(len(d.rows), d.offset+available)
-	wide := d.width >= 118
+	wide := d.width >= 160
 	d.discovery.Rows = d.discovery.Rows[:0]
 	if wide {
-		d.discovery.Rows = append(d.discovery.Rows, []string{"Category", "Device", "Address", "Model / Platform", "Interface", "Neighbor / Service", "VLAN", "Protocols", "Age", "TTL"})
-		d.discovery.ColumnWidths = fitWidths(d.width-2, []int{12, 20, 19, 20, 12, 20, 8, 14, 9, 9})
+		d.discovery.Rows = append(d.discovery.Rows, []string{"Category", "Device", "MAC", "Vendor", "Address", "Model / Platform", "Interface", "Neighbor / Service", "VLAN", "Protocols", "Age", "Uptime", "TTL"})
+		d.discovery.ColumnWidths = fitWidths(d.width-2, []int{11, 18, 18, 20, 18, 18, 11, 17, 7, 13, 8, 14, 8})
 	} else {
-		d.discovery.Rows = append(d.discovery.Rows, []string{"Device", "Address", "Interface", "Category", "Protocols", "Age"})
-		d.discovery.ColumnWidths = fitWidths(d.width-2, []int{22, 21, 13, 12, 17, 10})
+		d.discovery.Rows = append(d.discovery.Rows, []string{"Device", "MAC", "Vendor", "Address", "Interface", "Category", "Protocols", "Age", "Uptime"})
+		d.discovery.ColumnWidths = fitWidths(d.width-2, []int{19, 18, 18, 18, 11, 11, 13, 8, 14})
 	}
 	for _, row := range d.rows[d.offset:end] {
 		category := "SEGMENT"
@@ -334,10 +336,11 @@ func (d *dashboard) updateDiscoveryTable(now time.Time) {
 		}
 		age := shortDuration(now.Sub(row.lastSeen))
 		ttl := shortDuration(time.Until(row.link.ExpiresAt))
+		uptime := uptimeSummary(row.device, now)
 		if wide {
-			d.discovery.Rows = append(d.discovery.Rows, []string{category, row.name, row.address, row.platform, string(row.link.LocalInterface), row.neighbor, vlanSummary(row.link.VLANs), row.protocols, age, ttl})
+			d.discovery.Rows = append(d.discovery.Rows, []string{category, row.name, row.mac, row.vendor, row.address, row.platform, string(row.link.LocalInterface), row.neighbor, vlanSummary(row.link.VLANs), row.protocols, age, uptime, ttl})
 		} else {
-			d.discovery.Rows = append(d.discovery.Rows, []string{row.name, row.address, string(row.link.LocalInterface), category, row.protocols, age})
+			d.discovery.Rows = append(d.discovery.Rows, []string{row.name, row.mac, row.vendor, row.address, string(row.link.LocalInterface), category, row.protocols, age, uptime})
 		}
 	}
 }
@@ -372,6 +375,52 @@ func addressSummary(device *omnidiscover.DiscoveredDevice) string {
 		out += fmt.Sprintf(" +%d", len(device.Addresses)-1)
 	}
 	return out
+}
+
+func bestDeviceMAC(device *omnidiscover.DiscoveredDevice) omnidiscover.MAC {
+	if device == nil {
+		return omnidiscover.MAC{}
+	}
+	if len(device.ObservedMACs) != 0 {
+		return device.ObservedMACs[0]
+	}
+	if len(device.ClaimedMACs) != 0 {
+		return device.ClaimedMACs[0]
+	}
+	if device.Key.Kind == omnidiscover.DeviceKeyMAC {
+		return device.Key.MAC
+	}
+	return omnidiscover.MAC{}
+}
+
+func vendorSummary(device *omnidiscover.DiscoveredDevice) string {
+	result := omnidiscover.LookupMACVendor(bestDeviceMAC(device))
+	switch result.Source {
+	case omnidiscover.MACVendorIEEEMAL, omnidiscover.MACVendorIEEEMAM, omnidiscover.MACVendorIEEEMAS:
+		return result.Name
+	case omnidiscover.MACVendorLocallyAdministered:
+		return "Private / randomized"
+	case omnidiscover.MACVendorMulticast:
+		return "Multicast"
+	default:
+		return "Unknown"
+	}
+}
+
+func uptimeSummary(device *omnidiscover.DiscoveredDevice, now time.Time) string {
+	if device == nil || !device.Uptime.Valid {
+		return "-"
+	}
+	duration := device.Uptime.Current(now)
+	total := uint64(duration / time.Second)
+	days := total / 86400
+	hours := total % 86400 / 3600
+	minutes := total % 3600 / 60
+	seconds := total % 60
+	if days != 0 {
+		return fmt.Sprintf("%dd %02d:%02d:%02d", days, hours, minutes, seconds)
+	}
+	return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
 }
 
 func serviceSummary(device *omnidiscover.DiscoveredDevice) string {

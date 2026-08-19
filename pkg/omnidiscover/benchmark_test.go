@@ -2,6 +2,7 @@ package omnidiscover
 
 import (
 	"net/netip"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -43,6 +44,9 @@ func BenchmarkDecodeMDNS(b *testing.B) {
 }
 
 func BenchmarkRouteFrame(b *testing.B) {
+	if runtime.GOOS == "windows" {
+		b.Skip("live LLDP routing is unsupported on Windows")
+	}
 	e, err := New(Config{Protocols: ProtocolsLLDP, MaxDevices: 4, MaxLinks: 4, MaxDNSRecords: 4, ProtocolQueue: 256, MaxFrameSize: 2048})
 	if err != nil {
 		b.Fatal(err)
@@ -56,6 +60,36 @@ func BenchmarkRouteFrame(b *testing.B) {
 			e.releasePacket(slot)
 		default:
 			b.Fatal("route did not enqueue")
+		}
+	}
+}
+
+func BenchmarkLookupMACVendor(b *testing.B) {
+	macs := [...]MAC{
+		{0x48, 0xa9, 0x8a, 0x2c, 0x48, 0x32}, // MA-L
+		{0xc8, 0x5c, 0xe2, 0x70, 0x00, 0x01}, // MA-M
+		{0x8c, 0x1f, 0x64, 0xaf, 0xa0, 0x01}, // MA-S
+		{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}, // locally administered
+	}
+	i := 0
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = LookupMACVendor(macs[i&3])
+		i++
+	}
+}
+
+func BenchmarkMDNSIdenticalRefresh(b *testing.B) {
+	cfg := Config{Protocols: ProtocolsMDNS, MaxDevices: 4, MaxLinks: 4, MaxDNSRecords: 16, MaxAlternatives: 4, TimingWheelSlots: 64}.withDefaults()
+	s := newFusionState(cfg, &Classifier{})
+	msg := MDNSMessage{Records: []DNSRecord{{Name: []byte("printer.local"), Type: DNSRecordA, Class: 1, TTL: 120, Address: netip.MustParseAddr("192.0.2.44")}}}
+	meta := observationMeta{protocol: ProtocolMDNS, interfaceIndex: 1, interfaceName: "eth0", timestamp: time.Unix(1, 0), sourceIP: netip.MustParseAddr("192.0.2.44")}
+	s.observeMDNS(meta, &msg, nil)
+	b.ReportAllocs()
+	for b.Loop() {
+		meta.timestamp = meta.timestamp.Add(time.Second)
+		if events := s.observeMDNS(meta, &msg, nil); len(events) != 0 {
+			b.Fatal("identical mDNS refresh emitted an event")
 		}
 	}
 }

@@ -178,8 +178,8 @@ func (p *eventPrinter) handle(event omnidiscover.EventView) {
 		_ = p.encoder.Encode(view)
 		return
 	}
-	fmt.Fprintf(p.out, "%s %-7s device=%s name=%q addresses=%s link=%s interface=%s protocols=%s",
-		view.Time, view.Event, view.DeviceKey, view.Name, strings.Join(view.Addresses, ","), view.LinkKind, view.Interface, strings.Join(view.Protocols, ","))
+	fmt.Fprintf(p.out, "%s %-7s device=%s name=%q mac=%s vendor=%q uptime=%s addresses=%s link=%s interface=%s protocols=%s",
+		view.Time, view.Event, view.DeviceKey, view.Name, view.MAC, view.Vendor, view.Uptime, strings.Join(view.Addresses, ","), view.LinkKind, view.Interface, strings.Join(view.Protocols, ","))
 	if view.RemotePort != "" {
 		fmt.Fprintf(p.out, " remote-port=%q", view.RemotePort)
 	}
@@ -232,6 +232,10 @@ type outputEvent struct {
 	Platform   string   `json:"platform,omitempty"`
 	Software   string   `json:"software,omitempty"`
 	Addresses  []string `json:"addresses,omitempty"`
+	MAC        string   `json:"mac,omitempty"`
+	Vendor     string   `json:"vendor,omitempty"`
+	Uptime     string   `json:"uptime,omitempty"`
+	UptimeSecs uint64   `json:"uptime_seconds,omitempty"`
 	Protocols  []string `json:"protocols"`
 	Class      string   `json:"class,omitempty"`
 	Rule       string   `json:"matched_rule,omitempty"`
@@ -245,11 +249,20 @@ type outputEvent struct {
 
 func makeOutputEvent(event omnidiscover.EventView) outputEvent {
 	d, link := event.Device, event.Link
+	mac := bestDeviceMAC(d)
+	now := time.Now()
+	uptime := uptimeSummary(d, now)
+	var uptimeSeconds uint64
+	if d.Uptime.Valid {
+		uptimeSeconds = uint64(d.Uptime.Current(now) / time.Second)
+	} else {
+		uptime = ""
+	}
 	out := outputEvent{
 		Type: "event", Time: link.LastSeen.UTC().Format(time.RFC3339Nano), Event: eventKind(event.Kind),
 		Changed: uint64(event.Changed), DeviceKey: deviceKey(d.Key), Name: string(d.SystemName.Current()),
 		HostName: string(d.HostName.Current()), Model: string(d.Model.Current()), Platform: string(d.Platform.Current()),
-		Software: string(d.SoftwareVersion.Current()), Protocols: protocolNames(d.Protocols), Class: string(d.Class),
+		Software: string(d.SoftwareVersion.Current()), MAC: macString(mac), Vendor: vendorSummary(d), Uptime: uptime, UptimeSecs: uptimeSeconds, Protocols: protocolNames(d.Protocols), Class: string(d.Class),
 		Rule: string(d.MatchedRule), LinkKind: linkKind(link.Kind), Interface: string(link.LocalInterface),
 		SourceMAC: macString(link.ObservedSourceMAC), RemotePort: string(link.RemotePort.Value), VLANs: link.VLANs,
 	}

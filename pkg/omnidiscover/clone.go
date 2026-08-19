@@ -31,9 +31,11 @@ func cloneDeviceInto(dst, src *DiscoveredDevice) {
 	cloneTextFieldInto(&dst.SystemName, &src.SystemName)
 	cloneTextFieldInto(&dst.HostName, &src.HostName)
 	cloneTextFieldInto(&dst.ProtocolDeviceID, &src.ProtocolDeviceID)
+	cloneTextFieldInto(&dst.Vendor, &src.Vendor)
 	cloneTextFieldInto(&dst.Model, &src.Model)
 	cloneTextFieldInto(&dst.Platform, &src.Platform)
 	cloneTextFieldInto(&dst.SoftwareVersion, &src.SoftwareVersion)
+	dst.Uptime = src.Uptime
 	dst.Capabilities = src.Capabilities
 	for i := range dst.Services {
 		dst.Services[i].Instance = dst.Services[i].Instance[:0]

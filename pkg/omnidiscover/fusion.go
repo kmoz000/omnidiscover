@@ -13,6 +13,7 @@ type deviceEntry struct {
 	device     DiscoveredDevice
 	links      []int
 	dns        []int
+	dnsExpiry  time.Time
 }
 
 type linkEntry struct {
@@ -31,6 +32,7 @@ type dnsKey struct {
 	h1     uint64
 	h2     uint64
 	typ    DNSRecordType
+	class  uint16
 }
 
 type dnsEntry struct {
@@ -174,6 +176,7 @@ func (s *fusionState) deviceFor(meta observationMeta, claimed MAC, addresses []n
 	d.used = true
 	d.generation++
 	d.device.Reset()
+	d.dnsExpiry = time.Time{}
 	d.device.Key = key
 	d.device.FirstSeen = meta.timestamp
 	d.device.LastSeen = meta.timestamp
@@ -252,9 +255,13 @@ func (s *fusionState) mergeDevices(dstIdx, srcIdx int, events []EventView) []Eve
 	mergeTextField(&dst.device.SystemName, &src.device.SystemName, s.cfg.MaxAlternatives)
 	mergeTextField(&dst.device.HostName, &src.device.HostName, s.cfg.MaxAlternatives)
 	mergeTextField(&dst.device.ProtocolDeviceID, &src.device.ProtocolDeviceID, s.cfg.MaxAlternatives)
+	mergeTextField(&dst.device.Vendor, &src.device.Vendor, s.cfg.MaxAlternatives)
 	mergeTextField(&dst.device.Model, &src.device.Model, s.cfg.MaxAlternatives)
 	mergeTextField(&dst.device.Platform, &src.device.Platform, s.cfg.MaxAlternatives)
 	mergeTextField(&dst.device.SoftwareVersion, &src.device.SoftwareVersion, s.cfg.MaxAlternatives)
+	if src.device.Uptime.Valid && (!dst.device.Uptime.Valid || src.device.Uptime.ObservedAt.After(dst.device.Uptime.ObservedAt)) {
+		dst.device.Uptime = src.device.Uptime
+	}
 	dst.device.Protocols |= src.device.Protocols
 	dst.device.Capabilities |= src.device.Capabilities
 	if dst.device.FirstSeen.IsZero() || src.device.FirstSeen.Before(dst.device.FirstSeen) {
@@ -296,12 +303,16 @@ func (s *fusionState) mergeDevices(dstIdx, srcIdx int, events []EventView) []Eve
 		} else {
 			s.dnsByKey[de.key] = di
 			dst.dns = append(dst.dns, di)
+			if de.expiresAt.After(dst.dnsExpiry) {
+				dst.dnsExpiry = de.expiresAt
+			}
 		}
 	}
 	delete(s.deviceByKey, src.device.Key)
 	src.used = false
 	src.links = src.links[:0]
 	src.dns = src.dns[:0]
+	src.dnsExpiry = time.Time{}
 	src.device.Reset()
 	s.freeDevices = append(s.freeDevices, srcIdx)
 	s.rebuildServices(dstIdx)
@@ -687,19 +698,23 @@ func (s *fusionState) cacheDNS(deviceIdx int, record *DNSRecord, now time.Time) 
 	key := makeDNSKey(deviceIdx, record)
 	if record.TTL == 0 {
 		if idx, ok := s.dnsByKey[key]; ok {
-			s.removeDNS(idx)
-			return true
+			// RFC 6762 Section 10.1 gives cooperating responders one second
+			// to rescue a record after a goodbye instead of deleting it now.
+			s.setDNSExpiry(idx, now, now.Add(time.Second))
 		}
 		return false
 	}
 	expires := now.Add(time.Duration(record.TTL) * time.Second)
 	if idx, ok := s.dnsByKey[key]; ok {
 		e := &s.dns[idx]
-		changed := !dnsRecordEqual(&e.record, record)
-		cloneDNSRecord(&e.record, record)
-		e.expiresAt = expires
-		s.scheduleDNS(idx, now, expires)
-		return changed
+		// The key already proves owner/type/class/RDATA identity. Refresh
+		// only cache metadata and avoid copying variable fields in this hot path.
+		e.record.TTL = record.TTL
+		e.record.CacheFlush = record.CacheFlush
+		s.setDNSExpiry(idx, now, expires)
+		// TTL and cache-flush changes refresh cache metadata; the RR's
+		// logical identity and RDATA are already represented by the key.
+		return false
 	}
 	idx := s.allocDNS()
 	if idx < 0 {
@@ -709,54 +724,70 @@ func (s *fusionState) cacheDNS(deviceIdx int, record *DNSRecord, now time.Time) 
 	e.used = true
 	e.key = key
 	e.device = deviceIdx
-	e.expiresAt = expires
+	e.expiresAt = time.Time{}
 	e.wheelSlot, e.wheelPrev, e.wheelNext = -1, -1, -1
 	cloneDNSRecord(&e.record, record)
 	s.dnsByKey[key] = idx
 	s.devices[deviceIdx].dns = append(s.devices[deviceIdx].dns, idx)
-	s.scheduleDNS(idx, now, expires)
+	s.setDNSExpiry(idx, now, expires)
 	return true
 }
 
+func (s *fusionState) setDNSExpiry(idx int, now, expires time.Time) {
+	e := &s.dns[idx]
+	old := e.expiresAt
+	e.expiresAt = expires
+	s.scheduleDNS(idx, now, expires)
+	if e.device < 0 || e.device >= len(s.devices) || !s.devices[e.device].used {
+		return
+	}
+	d := &s.devices[e.device]
+	if expires.After(d.dnsExpiry) {
+		d.dnsExpiry = expires
+	} else if old.Equal(d.dnsExpiry) && expires.Before(old) {
+		s.recomputeDNSExpiry(e.device)
+	}
+}
+
+func (s *fusionState) recomputeDNSExpiry(deviceIdx int) {
+	d := &s.devices[deviceIdx]
+	d.dnsExpiry = time.Time{}
+	for _, idx := range d.dns {
+		if idx >= 0 && idx < len(s.dns) && s.dns[idx].used && s.dns[idx].expiresAt.After(d.dnsExpiry) {
+			d.dnsExpiry = s.dns[idx].expiresAt
+		}
+	}
+}
+
 func makeDNSKey(device int, r *DNSRecord) dnsKey {
-	h1 := hash64(1469598103934665603, r.Name)
-	h2 := hash64(1099511628211, r.Name)
+	h1, h2 := hashPair(1469598103934665603, 1099511628211, r.Name)
 	var fixed [16]byte
 	switch r.Type {
 	case DNSRecordA, DNSRecordAAAA:
 		if r.Address.IsValid() {
 			fixed = r.Address.As16()
-			h1 = hash64(h1, fixed[:])
-			h2 = hash64(h2, fixed[:])
+			h1, h2 = hashPair(h1, h2, fixed[:])
 		}
 	case DNSRecordPTR:
-		h1 = hash64(h1, r.Target)
-		h2 = hash64(h2, r.Target)
+		h1, h2 = hashPair(h1, h2, r.Target)
 	case DNSRecordSRV:
-		h1 = hash64(h1, r.Target)
-		h2 = hash64(h2, r.Target)
+		h1, h2 = hashPair(h1, h2, r.Target)
 		h1 ^= uint64(r.Port)<<32 | uint64(r.Priority)<<16 | uint64(r.Weight)
 		h2 ^= uint64(r.Port)<<16 | uint64(r.Weight)
 	case DNSRecordTXT:
-		h1 = hash64(h1, r.TXT)
-		h2 = hash64(h2, r.TXT)
+		h1, h2 = hashPair(h1, h2, r.TXT)
 	}
-	return dnsKey{device: device, h1: h1, h2: h2, typ: r.Type}
+	return dnsKey{device: device, h1: h1, h2: h2, typ: r.Type, class: r.Class}
 }
 
-func hash64(seed uint64, b []byte) uint64 {
-	h := seed
+func hashPair(h1, h2 uint64, b []byte) (uint64, uint64) {
 	for _, c := range b {
-		h ^= uint64(c)
-		h *= 1099511628211
+		h1 ^= uint64(c)
+		h1 *= 1099511628211
+		h2 ^= uint64(c)
+		h2 *= 1099511628211
 	}
-	return h
-}
-
-func dnsRecordEqual(a, b *DNSRecord) bool {
-	return a.Type == b.Type && a.Class == b.Class && a.CacheFlush == b.CacheFlush && a.TTL == b.TTL &&
-		a.Address == b.Address && a.Port == b.Port && a.Priority == b.Priority && a.Weight == b.Weight &&
-		bytes.Equal(a.Name, b.Name) && bytes.Equal(a.Target, b.Target) && bytes.Equal(a.TXT, b.TXT)
+	return h1, h2
 }
 
 func cloneDNSRecord(dst, src *DNSRecord) {
@@ -804,6 +835,8 @@ func (s *fusionState) removeDNS(idx int) {
 		return
 	}
 	e := &s.dns[idx]
+	deviceIdx := e.device
+	wasLatest := deviceIdx >= 0 && deviceIdx < len(s.devices) && e.expiresAt.Equal(s.devices[deviceIdx].dnsExpiry)
 	s.unscheduleDNS(idx)
 	delete(s.dnsByKey, e.key)
 	if e.device >= 0 && e.device < len(s.devices) && s.devices[e.device].used {
@@ -821,6 +854,9 @@ func (s *fusionState) removeDNS(idx int) {
 	e.expiresAt = time.Time{}
 	e.key = dnsKey{}
 	s.freeDNS = append(s.freeDNS, idx)
+	if wasLatest && s.devices[deviceIdx].used {
+		s.recomputeDNSExpiry(deviceIdx)
+	}
 }
 
 func (s *fusionState) scheduleDNS(idx int, now, expiry time.Time) {
@@ -993,6 +1029,9 @@ func (s *fusionState) observeLLDP(meta observationMeta, msg *LLDPMessage, events
 		d.ObservedMACs = appendUniqueMAC(d.ObservedMACs, meta.sourceMAC)
 		if len(d.ObservedMACs) != before {
 			changed |= FieldIdentity
+			if s.mergeMACVendor(d, meta.sourceMAC, meta.protocol.Set(), 3, meta.timestamp) {
+				changed |= FieldVendor
+			}
 		}
 	}
 	if claimed.IsUnicast() && claimed != meta.sourceMAC {
@@ -1000,6 +1039,9 @@ func (s *fusionState) observeLLDP(meta observationMeta, msg *LLDPMessage, events
 		d.ClaimedMACs = appendUniqueMAC(d.ClaimedMACs, claimed)
 		if len(d.ClaimedMACs) != before {
 			changed |= FieldIdentity
+			if s.mergeMACVendor(d, claimed, meta.protocol.Set(), 2, meta.timestamp) {
+				changed |= FieldVendor
+			}
 		}
 	}
 	for _, a := range addresses {
@@ -1078,6 +1120,9 @@ func (s *fusionState) observeCDP(meta observationMeta, msg *CDPMessage, events [
 		d.ObservedMACs = appendUniqueMAC(d.ObservedMACs, meta.sourceMAC)
 		if len(d.ObservedMACs) != before {
 			changed |= FieldIdentity
+			if s.mergeMACVendor(d, meta.sourceMAC, meta.protocol.Set(), 3, meta.timestamp) {
+				changed |= FieldVendor
+			}
 		}
 	}
 	for _, a := range msg.Addresses {
@@ -1102,6 +1147,11 @@ func (s *fusionState) observeCDP(meta observationMeta, msg *CDPMessage, events [
 	}
 	if mergeText(&d.Platform, msg.Details.Platform, ProtocolsCDP, 3, meta.timestamp, s.cfg.MaxAlternatives) {
 		changed |= FieldPlatform
+	}
+	// CDP's Platform TLV commonly carries the concrete hardware platform
+	// identifier, so retain it as model evidence as well as platform evidence.
+	if mergeText(&d.Model, msg.Details.Platform, ProtocolsCDP, 3, meta.timestamp, s.cfg.MaxAlternatives) {
+		changed |= FieldModel
 	}
 	if mergeText(&d.SoftwareVersion, msg.Details.SoftwareVersion, ProtocolsCDP, 3, meta.timestamp, s.cfg.MaxAlternatives) {
 		changed |= FieldSoftware
@@ -1168,6 +1218,9 @@ func (s *fusionState) observeMNDP(meta observationMeta, msg *MNDPMessage, events
 		d.ObservedMACs = appendUniqueMAC(d.ObservedMACs, meta.sourceMAC)
 		if len(d.ObservedMACs) != before {
 			changed |= FieldIdentity
+			if s.mergeMACVendor(d, meta.sourceMAC, meta.protocol.Set(), 3, meta.timestamp) {
+				changed |= FieldVendor
+			}
 		}
 	}
 	if msg.HasMAC {
@@ -1175,6 +1228,9 @@ func (s *fusionState) observeMNDP(meta observationMeta, msg *MNDPMessage, events
 		d.ClaimedMACs = appendUniqueMAC(d.ClaimedMACs, msg.MAC)
 		if len(d.ClaimedMACs) != before {
 			changed |= FieldIdentity
+			if s.mergeMACVendor(d, msg.MAC, meta.protocol.Set(), 2, meta.timestamp) {
+				changed |= FieldVendor
+			}
 		}
 	}
 	if meta.sourceIP.IsValid() {
@@ -1200,11 +1256,14 @@ func (s *fusionState) observeMNDP(meta observationMeta, msg *MNDPMessage, events
 	if mergeText(&d.Platform, msg.Details.Platform, ProtocolsMNDP, 3, meta.timestamp, s.cfg.MaxAlternatives) {
 		changed |= FieldPlatform
 	}
-	if mergeText(&d.Model, msg.Details.Board, ProtocolsMNDP, 3, meta.timestamp, s.cfg.MaxAlternatives) {
+	if mergeText(&d.Model, msg.Details.Board, ProtocolsMNDP, 4, meta.timestamp, s.cfg.MaxAlternatives) {
 		changed |= FieldModel
 	}
 	if mergeText(&d.SoftwareVersion, msg.Details.Version, ProtocolsMNDP, 3, meta.timestamp, s.cfg.MaxAlternatives) {
 		changed |= FieldSoftware
+	}
+	if msg.Details.HasUptime && mergeDeviceUptime(&d.Uptime, uint64(msg.Details.UptimeSeconds), ProtocolsMNDP, meta.timestamp) {
+		changed |= FieldUptime
 	}
 	if d.Protocols&ProtocolsMNDP == 0 {
 		d.Protocols |= ProtocolsMNDP
@@ -1236,11 +1295,14 @@ func (s *fusionState) observeMNDP(meta observationMeta, msg *MNDPMessage, events
 }
 
 func (s *fusionState) observeMDNS(meta observationMeta, msg *MDNSMessage, events []EventView) []EventView {
-	var addressStorage [maxDNSRecordsPerMessage]netip.Addr
+	var addressStorage [1]netip.Addr
 	addresses := addressStorage[:0]
-	for i := range msg.Records {
-		if msg.Records[i].Address.IsValid() {
-			addresses = appendUniqueAddr(addresses, msg.Records[i].Address)
+	if !meta.sourceIP.IsValid() {
+		for i := range msg.Records {
+			if msg.Records[i].Address.IsValid() {
+				addresses = append(addresses, msg.Records[i].Address)
+				break
+			}
 		}
 	}
 	idx, events := s.deviceFor(meta, MAC{}, addresses, events)
@@ -1255,6 +1317,9 @@ func (s *fusionState) observeMDNS(meta observationMeta, msg *MDNSMessage, events
 		d.ObservedMACs = appendUniqueMAC(d.ObservedMACs, meta.sourceMAC)
 		if len(d.ObservedMACs) != before {
 			changed |= FieldIdentity
+			if s.mergeMACVendor(d, meta.sourceMAC, meta.protocol.Set(), 3, meta.timestamp) {
+				changed |= FieldVendor
+			}
 		}
 	}
 	if meta.sourceIP.IsValid() {
@@ -1264,31 +1329,21 @@ func (s *fusionState) observeMDNS(meta observationMeta, msg *MDNSMessage, events
 			changed |= FieldAddresses
 		}
 	}
-	maxTTL := uint32(1)
 	cacheChanged := false
-	var flushed [maxDNSRecordsPerMessage]struct {
-		name []byte
-		typ  DNSRecordType
-	}
-	flushedCount := 0
 	for i := range msg.Records {
 		r := &msg.Records[i]
 		if r.CacheFlush {
 			seen := false
-			for j := 0; j < flushedCount; j++ {
-				if flushed[j].typ == r.Type && bytes.Equal(flushed[j].name, r.Name) {
+			for j := 0; j < i; j++ {
+				prior := &msg.Records[j]
+				if prior.CacheFlush && prior.Type == r.Type && prior.Class == r.Class && bytes.Equal(prior.Name, r.Name) {
 					seen = true
 					break
 				}
 			}
 			if !seen {
-				s.flushDNSSet(idx, r.Name, r.Type, msg.Records)
-				flushed[flushedCount].name, flushed[flushedCount].typ = r.Name, r.Type
-				flushedCount++
+				s.flushDNSSet(idx, r.Name, r.Type, r.Class, msg.Records, meta.timestamp)
 			}
-		}
-		if r.TTL > maxTTL {
-			maxTTL = r.TTL
 		}
 		if s.cacheDNS(idx, r, meta.timestamp) {
 			cacheChanged = true
@@ -1314,7 +1369,16 @@ func (s *fusionState) observeMDNS(meta observationMeta, msg *MDNSMessage, events
 		changed |= FieldIdentity
 	}
 	updateDeviceTimes(d, meta.timestamp)
-	li, linkChanged, added, events := s.upsertLink(meta, idx, SegmentPresence, time.Duration(maxTTL)*time.Second, events)
+	dnsTTL := time.Second
+	if !s.devices[idx].dnsExpiry.IsZero() && !meta.timestamp.IsZero() {
+		dnsTTL = s.devices[idx].dnsExpiry.Sub(meta.timestamp)
+	} else if !s.devices[idx].dnsExpiry.IsZero() {
+		dnsTTL = time.Until(s.devices[idx].dnsExpiry)
+	}
+	if dnsTTL < time.Second {
+		dnsTTL = time.Second
+	}
+	li, linkChanged, added, events := s.upsertLink(meta, idx, SegmentPresence, dnsTTL, events)
 	if li < 0 {
 		return events
 	}
@@ -1335,7 +1399,7 @@ func (s *fusionState) observeMDNS(meta observationMeta, msg *MDNSMessage, events
 	return events
 }
 
-func (s *fusionState) flushDNSSet(deviceIdx int, name []byte, typ DNSRecordType, incoming []DNSRecord) {
+func (s *fusionState) flushDNSSet(deviceIdx int, name []byte, typ DNSRecordType, class uint16, incoming []DNSRecord, now time.Time) {
 	d := &s.devices[deviceIdx]
 	for pos := 0; pos < len(d.dns); {
 		idx := d.dns[pos]
@@ -1344,17 +1408,25 @@ func (s *fusionState) flushDNSSet(deviceIdx int, name []byte, typ DNSRecordType,
 			continue
 		}
 		r := &s.dns[idx].record
-		if r.Type == typ && bytes.Equal(r.Name, name) {
+		if r.Type == typ && r.Class == class && bytes.Equal(r.Name, name) {
 			keep := false
 			for i := range incoming {
-				if incoming[i].Type == typ && bytes.Equal(incoming[i].Name, name) && makeDNSKey(deviceIdx, &incoming[i]) == s.dns[idx].key {
+				if incoming[i].Type == typ && incoming[i].Class == class && bytes.Equal(incoming[i].Name, name) && makeDNSKey(deviceIdx, &incoming[i]) == s.dns[idx].key {
 					keep = true
 					break
 				}
 			}
 			if !keep {
-				s.removeDNS(idx)
-				continue
+				e := &s.dns[idx]
+				receivedAt := e.expiresAt.Add(-time.Duration(e.record.TTL) * time.Second)
+				// RFC 6762 Section 10.2 preserves records received in the
+				// preceding second so a multi-packet unique RRSet can arrive.
+				if now.Sub(receivedAt) > time.Second {
+					expires := now.Add(time.Second)
+					if e.expiresAt.After(expires) {
+						s.setDNSExpiry(idx, now, expires)
+					}
+				}
 			}
 		}
 		pos++
@@ -1377,6 +1449,37 @@ func (s *fusionState) applyClassification(d *DiscoveredDevice) bool {
 	d.Class = copyBytes(d.Class, class)
 	d.MatchedRule = copyBytes(d.MatchedRule, rule)
 	return true
+}
+
+func (s *fusionState) mergeMACVendor(d *DiscoveredDevice, mac MAC, protocols ProtocolSet, confidence uint8, now time.Time) bool {
+	result := LookupMACVendor(mac)
+	if result.Source != MACVendorIEEEMAL && result.Source != MACVendorIEEEMAM && result.Source != MACVendorIEEEMAS {
+		return false
+	}
+	return mergeText(&d.Vendor, []byte(result.Name), protocols, confidence, now, s.cfg.MaxAlternatives)
+}
+
+func mergeDeviceUptime(dst *DeviceUptime, seconds uint64, protocols ProtocolSet, now time.Time) bool {
+	if !dst.Valid {
+		*dst = DeviceUptime{Seconds: seconds, ObservedAt: now, Protocols: protocols, Valid: true}
+		return true
+	}
+	expected := dst.Seconds
+	if now.After(dst.ObservedAt) {
+		expected += uint64(now.Sub(dst.ObservedAt) / time.Second)
+	}
+	delta := expected
+	if seconds >= expected {
+		delta = seconds - expected
+	} else {
+		delta = expected - seconds
+	}
+	changed := delta > 5 || dst.Protocols|protocols != dst.Protocols
+	dst.Seconds = seconds
+	dst.ObservedAt = now
+	dst.Protocols |= protocols
+	dst.Valid = true
+	return changed
 }
 
 func updateDeviceTimes(d *DiscoveredDevice, now time.Time) {
@@ -1502,6 +1605,7 @@ func (s *fusionState) dropDevice(idx int) {
 	d.device.Reset()
 	d.links = d.links[:0]
 	d.dns = d.dns[:0]
+	d.dnsExpiry = time.Time{}
 	s.freeDevices = append(s.freeDevices, idx)
 }
 

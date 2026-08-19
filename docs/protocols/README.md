@@ -13,6 +13,10 @@ on 2026-08-19. They are documentation inputs, not Go dependencies.
 | DNS wire format | RFC 1035 | [`rfc1035-dns.txt`](rfc1035-dns.txt) | [RFC Editor](https://www.rfc-editor.org/rfc/rfc1035.html) |
 | Android NSD API | DNS-SD over mDNS | [`android-network-service-discovery.html`](android-network-service-discovery.html) | [Android Developers](https://developer.android.com/develop/connectivity/wifi/use-nsd) |
 
+MAC vendor resolution uses the official IEEE MA-L, MA-M, and MA-S public
+listings. Update and lookup details are documented in
+[`ieee-mac-registry.md`](ieee-mac-registry.md).
+
 Android's NSD API maps to the existing DNS-SD/mDNS standards; see
 [`android-nsd.md`](android-nsd.md). Wi-Fi Aware/NAN is active radio discovery
 and is not an IP protocol that this passive library can capture.

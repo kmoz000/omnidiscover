@@ -10,6 +10,13 @@ mDNS mapping. The API exposes `ProtocolAndroidNSD`, `ProtocolsAndroidNSD`, and
 `DecodeAndroidNSD` aliases, plus DNS-SD TXT lookup and Google Cast profile
 recognition.
 
+![omnidiscover terminal dashboard](docs/screens/image.png)
+
+The canonical device view includes the best observed or directly claimed MAC,
+an IEEE MA-S/MA-M/MA-L vendor assignment, hardware model, platform, software
+version, and protocol-reported uptime. Locally administered MACs are shown as
+private/randomized instead of being incorrectly assigned to a manufacturer.
+
 ## Platform support
 
 | Platform | LLDP/CDP live capture | MNDP/mDNS live capture |
@@ -89,12 +96,29 @@ destination capacity, and never panic on malformed input. A status can be
 clean, ignored, partial, or fatal; only fatal input increments the malformed
 counter.
 
+## Canonical field mapping
+
+| Canonical field | LLDP | CDP | MNDP | mDNS/DNS-SD |
+| --- | --- | --- | --- | --- |
+| MAC | Observed Ethernet source; claimed chassis MAC retained separately | Observed Ethernet source | Direct MNDP MAC; observed Ethernet source when available | Observed Ethernet source when raw capture is available; otherwise fused only through direct IP/interface evidence |
+| Vendor | IEEE assignment for the selected MAC | IEEE assignment for the selected MAC | IEEE assignment for the selected MAC | IEEE assignment only when a MAC is directly known |
+| Model | No generic mandatory model TLV; no guessing from description | Platform TLV retained as model evidence | Board TLV, for example `RB952Ui-5ac2nD` | Service-profile data only when explicitly defined |
+| Platform | Explicit structured evidence only | Platform TLV | Platform TLV, for example `MikroTik` | Not inferred from service or hostname |
+| Software | Explicit structured evidence only | Software Version TLV | Version TLV | Profile-specific TXT remains service metadata |
+| Uptime | Not defined by base LLDP | Not defined by base CDP | Uptime TLV, extrapolated between announcements | Not defined generically |
+
+MNDP uptime refreshes within five seconds of the expected monotonic value update
+the baseline silently. A reboot or larger clock discontinuity emits a device
+change. This preserves fresh uptime without producing a redundant event for
+every announcement.
+
 ## Example command
 
 The repository includes a passive CLI with a refreshing `termui` dashboard.
 The top table reports findings, drops, ignored traffic, malformed packets, and
-partial decodes for each protocol. The discovery table categorizes physical and
-segment links; use `1`–`4`, `p`, `s`, or `a` to filter it.
+partial decodes for each protocol. The discovery table shows MAC, IEEE vendor,
+model/platform, uptime, and physical or segment link category; use `1`–`4`,
+`p`, `s`, or `a` to filter it.
 
 ```bash
 # Unprivileged UDP discovery on Linux, macOS, or Windows.
@@ -200,10 +224,14 @@ then declaration order. No vendor classification database is built in.
 - A single fusion goroutine owns live device, link, DNS, and timing-wheel state.
 - Packet slots and long-lived records use explicitly bounded slabs and
   freelists; owned snapshots and stream events are outside the capture hot path.
+- IEEE vendor lookup uses a 12-bit first-level index and bounded binary search,
+  then applies 36/28/24-bit longest-prefix precedence without heap allocation.
 - Ethernet routing directly dispatches EtherType, Cisco LLC/SNAP, or UDP port.
   Regex is never used to identify packets.
 - mDNS questions, MNDP refresh requests, and locally transmitted BPF packets are
   ignored; omnidiscover does not actively probe the network.
+- mDNS goodbye records and cache-flush announcements use RFC 6762's one-second
+  rescue window; TTL-only refreshes update expiry without emitting changes.
 
 The passive receive pipeline was informed by
 [Linceo](https://github.com/MarcosGiojiho/linceo), while protocol interoperability
@@ -221,12 +249,17 @@ cmd/omnidiscover/     refreshing termui CLI, JSON, and plain output
 pkg/omnidiscover/     public capture, decoder, fusion, and classification API
 pkg/utils/            reusable allocation-conscious helpers
 docs/protocols/       authoritative protocol references and checksums
+utils/genoui/         IEEE registry compiler for static vendor lookup tables
 ```
 
 The protocol reference index is in
 [`docs/protocols/README.md`](docs/protocols/README.md). LLDP is standardized by
 IEEE, CDP and MNDP are proprietary vendor protocols, and mDNS/DNS-SD are the
 protocols defined by IETF RFCs 6762 and 6763.
+
+The generated MAC registry is sourced from the official IEEE MA-L, MA-M, and
+MA-S public listings. Its source digests and update procedure are documented in
+[`docs/protocols/ieee-mac-registry.md`](docs/protocols/ieee-mac-registry.md).
 
 ```bash
 CGO_ENABLED=0 go test ./...
@@ -236,6 +269,9 @@ go test -run '^$' -bench . -benchmem ./...
 
 The decoder fuzz targets accept arbitrary bytes and assert that parsing remains
 bounded and panic-free.
+
+Current CPU and allocation results, including mDNS refresh fusion and IEEE
+vendor lookup, are recorded in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## License
 

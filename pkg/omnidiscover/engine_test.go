@@ -8,23 +8,24 @@ import (
 )
 
 func TestRouteCaptureDirectDispatch(t *testing.T) {
-	e, err := New(Config{Protocols: ProtocolsLLDP, MaxDevices: 4, MaxLinks: 4, MaxDNSRecords: 4, ProtocolQueue: 2, MaxFrameSize: 2048})
+	e, err := New(Config{Protocols: ProtocolsMDNS, MaxDevices: 4, MaxLinks: 4, MaxDNSRecords: 4, ProtocolQueue: 2, MaxFrameSize: 2048})
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := ethernetFrame(MAC{1, 0, 0xc2, 0, 0, 0x0e}, MAC{0, 1, 2, 3, 4, 5}, EtherTypeLLDP, sampleLLDP(), 7)
+	frame := ipv4UDPFrame(MDNSPort, false, 7)
+	copy(frame[6:12], []byte{0, 1, 2, 3, 4, 5})
 	e.routeCapture(captureView{data: frame, interfaceName: "test0", interfaceIndex: 7, timestamp: time.Unix(1, 0), frame: true})
 	select {
-	case slot := <-e.queues[ProtocolLLDP]:
+	case slot := <-e.queues[ProtocolMDNS]:
 		if slot.meta.sourceMAC != (MAC{0, 1, 2, 3, 4, 5}) || slot.meta.vlanCount != 1 || slot.meta.vlans[0] != 7 {
 			t.Fatalf("metadata: %+v", slot.meta)
 		}
-		if len(slot.data) != len(sampleLLDP()) {
+		if len(slot.data) != 0 {
 			t.Fatalf("payload length=%d", len(slot.data))
 		}
 		e.releasePacket(slot)
 	default:
-		t.Fatal("LLDP was not routed")
+		t.Fatal("mDNS was not routed")
 	}
 }
 
@@ -43,16 +44,20 @@ func TestResolveWildcardUDPInterface(t *testing.T) {
 }
 
 func TestRouteCaptureWarmAllocations(t *testing.T) {
-	e, err := New(Config{Protocols: ProtocolsLLDP, MaxDevices: 4, MaxLinks: 4, MaxDNSRecords: 4, ProtocolQueue: 4, MaxFrameSize: 2048})
+	e, err := New(Config{Protocols: ProtocolsMDNS, MaxDevices: 4, MaxLinks: 4, MaxDNSRecords: 4, ProtocolQueue: 4, MaxFrameSize: 2048})
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame := ethernetFrame(MAC{1, 0, 0xc2, 0, 0, 0x0e}, MAC{0, 1, 2, 3, 4, 5}, EtherTypeLLDP, sampleLLDP())
+	frame := ipv4UDPFrame(MDNSPort, false)
 	view := captureView{data: frame, interfaceName: "test0", interfaceIndex: 7, timestamp: time.Unix(1, 0), frame: true}
 	allocs := testing.AllocsPerRun(1000, func() {
 		e.routeCapture(view)
-		slot := <-e.queues[ProtocolLLDP]
-		e.releasePacket(slot)
+		select {
+		case slot := <-e.queues[ProtocolMDNS]:
+			e.releasePacket(slot)
+		default:
+			panic("mDNS route did not enqueue")
+		}
 	})
 	if allocs != 0 {
 		t.Fatalf("route allocations=%v", allocs)
@@ -74,15 +79,15 @@ func TestOwnedStreamQueueCoalesces(t *testing.T) {
 }
 
 func TestSnapshotIsOwned(t *testing.T) {
-	e, err := New(Config{Protocols: ProtocolsLLDP, MaxDevices: 4, MaxLinks: 4, MaxDNSRecords: 4, ProtocolQueue: 2, MaxFrameSize: 2048})
+	e, err := New(Config{Protocols: ProtocolsMNDP, MaxDevices: 4, MaxLinks: 4, MaxDNSRecords: 4, ProtocolQueue: 2, MaxFrameSize: 2048})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var msg LLDPMessage
-	DecodeLLDPDU(sampleLLDP(), &msg)
-	meta := observationMeta{protocol: ProtocolLLDP, interfaceName: "eth0", interfaceIndex: 1, timestamp: time.Now(), sourceMAC: MAC{0, 1, 2, 3, 4, 5}}
+	mac := MAC{0, 1, 2, 3, 4, 5}
+	msg := MNDPMessage{MAC: mac, HasMAC: true, Details: MNDPDetails{Identity: []byte("router")}}
+	meta := observationMeta{protocol: ProtocolMNDP, interfaceName: "eth0", interfaceIndex: 1, timestamp: time.Now(), sourceMAC: mac}
 	e.stateMu.Lock()
-	e.state.observeLLDP(meta, &msg, nil)
+	e.state.observeMNDP(meta, &msg, nil)
 	e.stateMu.Unlock()
 	var snap Snapshot
 	e.Snapshot(&snap)

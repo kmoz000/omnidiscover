@@ -252,6 +252,18 @@ func TestMDNSQueryIsIgnoredNotMalformed(t *testing.T) {
 	}
 }
 
+func TestMDNSUnsupportedOpcodeAndRCodeAreIgnored(t *testing.T) {
+	for _, flags := range []uint16{0x8800, 0x8401} {
+		packet := make([]byte, 12)
+		binary.BigEndian.PutUint16(packet[2:4], flags)
+		var got MDNSMessage
+		status := DecodeMDNS(packet, &got)
+		if !status.Ignored() || status.Code != IssueUnsupported || status.Usable() {
+			t.Fatalf("flags=%#x status=%+v", flags, status)
+		}
+	}
+}
+
 func TestDNSCompressionLoop(t *testing.T) {
 	p := make([]byte, 24)
 	binary.BigEndian.PutUint16(p[2:4], 0x8400)

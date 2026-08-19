@@ -57,6 +57,26 @@ func TestDashboardCategorizesAndSortsLinks(t *testing.T) {
 	}
 }
 
+func TestDashboardShowsMACVendorModelAndUptime(t *testing.T) {
+	now := time.Unix(2000, 0).UTC()
+	mac := omnidiscover.MAC{0x48, 0xa9, 0x8a, 0x2c, 0x48, 0x32}
+	key := omnidiscover.DeviceKey{Kind: omnidiscover.DeviceKeyMAC, MAC: mac}
+	d := newDashboard(nil, dashboardConfig{})
+	d.snapshot.Devices = []omnidiscover.DiscoveredDevice{{
+		Key: key, ClaimedMACs: []omnidiscover.MAC{mac}, Model: textField("RB952Ui-5ac2nD"),
+		Uptime:    omnidiscover.DeviceUptime{Seconds: 2*86400 + 17*3600 + 47*60 + 23, ObservedAt: now, Protocols: omnidiscover.ProtocolsMNDP, Valid: true},
+		Protocols: omnidiscover.ProtocolsMNDP,
+	}}
+	d.snapshot.Links = []omnidiscover.DiscoveredLink{{Device: key, Kind: omnidiscover.SegmentPresence, Protocols: omnidiscover.ProtocolsMNDP, LastSeen: now}}
+	d.rebuildRows()
+	if len(d.rows) != 1 || d.rows[0].mac != "48:a9:8a:2c:48:32" || d.rows[0].vendor != "Routerboard.com" || d.rows[0].platform != "RB952Ui-5ac2nD" {
+		t.Fatalf("row=%+v", d.rows)
+	}
+	if got := uptimeSummary(d.rows[0].device, now); got != "2d 17:47:23" {
+		t.Fatalf("uptime=%q", got)
+	}
+}
+
 func textField(value string) omnidiscover.TextField {
 	return omnidiscover.TextField{Values: []omnidiscover.TextValue{{Value: []byte(value)}}}
 }

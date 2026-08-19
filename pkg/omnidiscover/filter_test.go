@@ -79,6 +79,7 @@ func ipv4UDPFrame(port uint16, fragmented bool, vlans ...uint16) []byte {
 	ip[9] = 17
 	binary.BigEndian.PutUint16(ip[20:22], 49152)
 	binary.BigEndian.PutUint16(ip[22:24], port)
+	binary.BigEndian.PutUint16(ip[24:26], 8)
 	return ethernetFrame(MAC{}, MAC{}, EtherTypeIPv4, ip, vlans...)
 }
 

@@ -54,6 +54,9 @@ func TestFusionDeduplicatesAndEnriches(t *testing.T) {
 	mndp.HasMAC = true
 	mndp.Details.Identity = []byte("edge-switch")
 	mndp.Details.Platform = []byte("RouterOS")
+	mndp.Details.Board = []byte("RB952Ui-5ac2nD")
+	mndp.Details.UptimeSeconds = 12345
+	mndp.Details.HasUptime = true
 	mndp.Addresses = []netip.Addr{netip.MustParseAddr("192.0.2.9")}
 	meta.protocol = ProtocolMNDP
 	meta.timestamp = now.Add(time.Second)
@@ -96,8 +99,30 @@ func TestFusionDeduplicatesAndEnriches(t *testing.T) {
 			d = &s.devices[i].device
 		}
 	}
-	if d.Protocols != ProtocolsAll || len(d.Services) != 1 || string(d.Platform.Current()) != "RouterOS" {
+	if d.Protocols != ProtocolsAll || len(d.Services) != 1 || string(d.Platform.Current()) != "RouterOS" ||
+		string(d.Model.Current()) != "RB952Ui-5ac2nD" || !d.Uptime.Valid || d.Uptime.Seconds != 12345 {
 		t.Fatalf("fused device: %+v", d)
+	}
+}
+
+func TestMNDPUptimeRefreshAndReboot(t *testing.T) {
+	s := testState(t, nil)
+	now := time.Unix(12000, 0).UTC()
+	mac := MAC{0x48, 0xa9, 0x8a, 0, 0, 1}
+	meta := observationMeta{protocol: ProtocolMNDP, interfaceName: "eth0", interfaceIndex: 1, timestamp: now}
+	msg := MNDPMessage{MAC: mac, HasMAC: true, Details: MNDPDetails{UptimeSeconds: 86400, HasUptime: true}}
+	if events := s.observeMNDP(meta, &msg, nil); len(events) != 1 || events[0].Changed&FieldUptime == 0 || string(events[0].Device.Vendor.Current()) != "Routerboard.com" {
+		t.Fatalf("initial uptime events=%+v", events)
+	}
+	meta.timestamp = now.Add(10 * time.Second)
+	msg.Details.UptimeSeconds = 86410
+	if events := s.observeMNDP(meta, &msg, nil); len(events) != 0 {
+		t.Fatalf("normal uptime refresh emitted=%+v", events)
+	}
+	meta.timestamp = now.Add(20 * time.Second)
+	msg.Details.UptimeSeconds = 3
+	if events := s.observeMNDP(meta, &msg, nil); len(events) != 1 || events[0].Changed&FieldUptime == 0 {
+		t.Fatalf("reboot uptime events=%+v", events)
 	}
 }
 
@@ -265,9 +290,62 @@ func TestMDNSCorrelatesAcrossPacketsAndHonorsGoodbye(t *testing.T) {
 	meta.timestamp = now.Add(2 * time.Second)
 	goodbye := MDNSMessage{Records: []DNSRecord{{Name: []byte("_http._tcp.local"), Type: DNSRecordPTR, Class: 1, TTL: 0, Target: instance}}}
 	events = s.observeMDNS(meta, &goodbye, events[:0])
-	if len(events) != 1 || len(events[0].Device.Services) != 0 {
-		t.Fatalf("goodbye event: %+v", events)
+	if len(events) != 0 || len(derefDevice(s, meta).Services) != 1 {
+		t.Fatalf("goodbye removed without RFC grace: %+v", events)
 	}
+	events = s.tick(now.Add(3*time.Second), events[:0])
+	if len(events) != 1 || len(events[0].Device.Services) != 0 {
+		t.Fatalf("goodbye expiry event: %+v", events)
+	}
+}
+
+func TestMDNSGoodbyeCanBeRescuedDuringGrace(t *testing.T) {
+	s := testState(t, nil)
+	now := time.Unix(6500, 0).UTC()
+	ip := netip.MustParseAddr("192.0.2.45")
+	meta := observationMeta{protocol: ProtocolMDNS, interfaceName: "eth0", interfaceIndex: 1, timestamp: now, sourceIP: ip}
+	record := DNSRecord{Name: []byte("speaker.local"), Type: DNSRecordA, Class: 1, TTL: 120, Address: ip}
+	s.observeMDNS(meta, &MDNSMessage{Records: []DNSRecord{record}}, nil)
+	meta.timestamp = now.Add(2 * time.Second)
+	goodbye := record
+	goodbye.TTL = 0
+	if events := s.observeMDNS(meta, &MDNSMessage{Records: []DNSRecord{goodbye}}, nil); len(events) != 0 {
+		t.Fatalf("goodbye emitted before grace: %+v", events)
+	}
+	meta.timestamp = now.Add(2500 * time.Millisecond)
+	if events := s.observeMDNS(meta, &MDNSMessage{Records: []DNSRecord{record}}, nil); len(events) != 0 {
+		t.Fatalf("rescue refresh emitted: %+v", events)
+	}
+	if events := s.tick(now.Add(3*time.Second), nil); len(events) != 0 {
+		t.Fatalf("rescued record expired: %+v", events)
+	}
+}
+
+func TestMDNSCacheFlushUsesOneSecondGrace(t *testing.T) {
+	s := testState(t, nil)
+	now := time.Unix(6800, 0).UTC()
+	source := netip.MustParseAddr("192.0.2.50")
+	first := DNSRecord{Name: []byte("host.local"), Type: DNSRecordA, Class: 1, TTL: 120, Address: netip.MustParseAddr("192.0.2.51")}
+	second := DNSRecord{Name: []byte("host.local"), Type: DNSRecordA, Class: 1, TTL: 120, Address: netip.MustParseAddr("192.0.2.52")}
+	meta := observationMeta{protocol: ProtocolMDNS, interfaceName: "eth0", interfaceIndex: 1, timestamp: now, sourceIP: source}
+	s.observeMDNS(meta, &MDNSMessage{Records: []DNSRecord{first, second}}, nil)
+	meta.timestamp = now.Add(2 * time.Second)
+	first.CacheFlush = true
+	s.observeMDNS(meta, &MDNSMessage{Records: []DNSRecord{first}}, nil)
+	device := derefDevice(s, meta)
+	idx := s.deviceByKey[device.Key]
+	if len(s.devices[idx].dns) != 2 {
+		t.Fatalf("cache flush removed immediately: %d records", len(s.devices[idx].dns))
+	}
+	s.tick(now.Add(3*time.Second), nil)
+	if len(s.devices[idx].dns) != 1 {
+		t.Fatalf("stale RRSet member not expired: %d records", len(s.devices[idx].dns))
+	}
+}
+
+func derefDevice(s *fusionState, meta observationMeta) *DiscoveredDevice {
+	key := DeviceKey{Kind: DeviceKeyIP, IP: meta.sourceIP, InterfaceIndex: meta.interfaceIndex}
+	return &s.devices[s.deviceByKey[key]].device
 }
 
 func TestFusionPromotesIPIdentityOnlyWithDirectMACEvidence(t *testing.T) {

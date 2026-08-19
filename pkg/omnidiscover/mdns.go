@@ -47,6 +47,12 @@ func DecodeMDNS(packet []byte, dst *MDNSMessage) DecodeStatus {
 		addIssue(&st, DecodeIgnored, IssueNotResponse, 2, dst.Flags)
 		return st
 	}
+	// RFC 6762 Sections 18.3 and 18.11 require silently ignoring multicast
+	// DNS messages with a non-zero OPCODE or RCODE.
+	if dst.Flags&0x7800 != 0 || dst.Flags&0x000f != 0 {
+		addIssue(&st, DecodeIgnored, IssueUnsupported, 2, dst.Flags)
+		return st
+	}
 	qd := int(binary.BigEndian.Uint16(packet[4:6]))
 	an := int(binary.BigEndian.Uint16(packet[6:8]))
 	ns := int(binary.BigEndian.Uint16(packet[8:10]))

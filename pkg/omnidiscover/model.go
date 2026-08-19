@@ -166,6 +166,27 @@ type DeviceKey struct {
 	InterfaceIndex int
 }
 
+// DeviceUptime is a protocol-reported uptime baseline. Current extrapolates
+// the value between observations without mutating engine state.
+type DeviceUptime struct {
+	Seconds    uint64
+	ObservedAt time.Time
+	Protocols  ProtocolSet
+	Valid      bool
+}
+
+func (u DeviceUptime) Current(now time.Time) time.Duration {
+	seconds := u.Seconds
+	if u.Valid && now.After(u.ObservedAt) {
+		seconds += uint64(now.Sub(u.ObservedAt) / time.Second)
+	}
+	const maxDurationSeconds = uint64((1<<63 - 1) / int64(time.Second))
+	if seconds > maxDurationSeconds {
+		seconds = maxDurationSeconds
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 // DiscoveredDevice is the fused device model shared by every protocol.
 type DiscoveredDevice struct {
 	Key              DeviceKey
@@ -175,9 +196,11 @@ type DiscoveredDevice struct {
 	SystemName       TextField
 	HostName         TextField
 	ProtocolDeviceID TextField
+	Vendor           TextField
 	Model            TextField
 	Platform         TextField
 	SoftwareVersion  TextField
+	Uptime           DeviceUptime
 	Capabilities     uint64
 	Services         []Service
 	Protocols        ProtocolSet
@@ -241,6 +264,8 @@ const (
 	FieldServices
 	FieldLink
 	FieldClassification
+	FieldVendor
+	FieldUptime
 )
 
 // EventView borrows Engine-owned storage and is valid only during Handler.
@@ -275,9 +300,11 @@ func (d *DiscoveredDevice) Reset() {
 	resetTextField(&d.SystemName)
 	resetTextField(&d.HostName)
 	resetTextField(&d.ProtocolDeviceID)
+	resetTextField(&d.Vendor)
 	resetTextField(&d.Model)
 	resetTextField(&d.Platform)
 	resetTextField(&d.SoftwareVersion)
+	d.Uptime = DeviceUptime{}
 	for i := range d.Services {
 		d.Services[i].Instance = d.Services[i].Instance[:0]
 		d.Services[i].Type = d.Services[i].Type[:0]
