@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://kmoz000.github.io/omnidiscover/sitemap.xml
