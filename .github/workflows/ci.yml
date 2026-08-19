@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./...
+
+  linux-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: cd docs/protocols && sha256sum --check SHA256SUMS
+      - run: go test -run '^$' -fuzz FuzzDecodeEthernet -fuzztime 10s ./pkg/omnidiscover
+      - run: go test -run '^$' -fuzz FuzzDecodeLLDP -fuzztime 10s ./pkg/omnidiscover
+      - run: go test -run '^$' -fuzz FuzzDecodeCDP -fuzztime 10s ./pkg/omnidiscover
+      - run: go test -run '^$' -fuzz FuzzDecodeMNDP -fuzztime 10s ./pkg/omnidiscover
+      - run: go test -run '^$' -fuzz FuzzDecodeMDNS -fuzztime 10s ./pkg/omnidiscover
